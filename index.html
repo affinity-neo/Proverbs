@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>오늘의 잠언</title>
+<style>
+  :root { --bg:#faf8f3; --fg:#2b2723; --muted:#8a8279; --accent:#6b4f2a; --line:#e6e0d4; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#1d1b19; --fg:#e8e3da; --muted:#9a9288; --accent:#d1a964; --line:#38342f; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+    font-family:"Noto Serif KR","Nanum Myeongjo",Georgia,serif; line-height:1.9; }
+  main { max-width:640px; margin:0 auto; padding:32px 20px 120px; }
+  header { text-align:center; margin-bottom:24px; }
+  .date { color:var(--muted); font-size:.9rem; }
+  h1 { margin:.2em 0 0; font-size:1.8rem; color:var(--accent); }
+  .player { position:sticky; top:0; background:var(--bg); padding:12px 0;
+    border-bottom:1px solid var(--line); margin-bottom:24px; z-index:1;
+    font-family:system-ui,sans-serif; }
+  .row { display:flex; align-items:center; gap:12px; }
+  #play { width:44px; height:44px; border-radius:50%; border:0; cursor:pointer;
+    background:var(--accent); color:var(--bg); font-size:1rem; flex:none; }
+  #seek { flex:1; accent-color:var(--accent); }
+  #time { color:var(--muted); font-size:.8rem; min-width:84px; text-align:right; font-variant-numeric:tabular-nums; }
+  .speed { display:flex; gap:6px; justify-content:center; margin-top:10px; flex-wrap:wrap; }
+  .speed button { border:1px solid var(--line); background:transparent; color:var(--fg);
+    padding:5px 12px; border-radius:999px; cursor:pointer; font-size:.85rem; }
+  .speed button.on { background:var(--accent); color:var(--bg); border-color:var(--accent); }
+  .verse { margin:0 0 .7em; font-size:1.08rem; }
+  .verse sup { color:var(--accent); font-size:.7rem; margin-right:6px; font-family:system-ui,sans-serif; }
+  .note { color:var(--muted); font-size:.9rem; text-align:center; font-family:system-ui,sans-serif; }
+  /* 소리만 사용하는 플레이어: 화면에는 보이지 않게 둠 */
+  #yt { position:absolute; left:-9999px; width:200px; height:200px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="date" id="date"></div>
+    <h1 id="title"></h1>
+  </header>
+
+  <div class="player">
+    <div class="row">
+      <button id="play" aria-label="재생">&#9654;</button>
+      <input type="range" id="seek" min="0" max="1000" value="0" aria-label="재생 위치">
+      <span id="time">0:00 / 0:00</span>
+    </div>
+    <div class="speed" id="speed"></div>
+    <p class="note" id="audioNote" hidden></p>
+  </div>
+
+  <article id="text"></article>
+</main>
+
+<div id="yt"></div>
+
+<script src="data.js"></script>
+<script>
+// 장별 음성 소스. 유튜브 영상 ID(소리만 사용) 또는 audio 폴더의 mp3.
+// 장을 추가할 때는 아래에 한 줄씩 넣으면 됩니다. (없는 장은 audio/NN.mp3 를 찾습니다)
+var VIDEOS = {
+  23: 'pnyMgDTydsc'
+};
+
+(function () {
+  var params = new URLSearchParams(location.search);
+  var now = new Date();
+  var day = parseInt(params.get('day'), 10) || now.getDate();
+  if (day < 1 || day > 31) day = now.getDate();
+
+  document.getElementById('date').textContent =
+    now.getFullYear() + '년 ' + (now.getMonth() + 1) + '월 ' + now.getDate() + '일';
+  document.getElementById('title').textContent = '잠언 ' + day + '장';
+  document.title = '오늘의 잠언 - 잠언 ' + day + '장';
+
+  // 본문
+  var box = document.getElementById('text');
+  var verses = (window.PROVERBS || {})[day];
+  if (verses && verses.length) {
+    verses.forEach(function (v, i) {
+      var p = document.createElement('p');
+      p.className = 'verse';
+      var s = document.createElement('sup');
+      s.textContent = i + 1;
+      p.appendChild(s);
+      p.appendChild(document.createTextNode(v));
+      box.appendChild(p);
+    });
+  } else {
+    box.innerHTML = '<p class="note">data.js 에 잠언 ' + day + '장 본문이 아직 없습니다.</p>';
+  }
+
+  // ---- 플레이어 공통 인터페이스 ----
+  var playBtn = document.getElementById('play');
+  var seek = document.getElementById('seek');
+  var timeEl = document.getElementById('time');
+  var note = document.getElementById('audioNote');
+  var speedWrap = document.getElementById('speed');
+  var speeds = [0.75, 1, 1.25, 1.5, 1.75, 2];
+  var rate = 1;
+  try { rate = parseFloat(localStorage.getItem('speed')) || 1; } catch (e) {}
+
+  var api = null;   // {play, pause, isPlaying, seekTo, cur, dur, setRate}
+  var dragging = false;
+
+  function fmt(t) {
+    t = Math.max(0, Math.floor(t || 0));
+    return Math.floor(t / 60) + ':' + String(t % 60).padStart(2, '0');
+  }
+  function refresh() {
+    if (!api) return;
+    var d = api.dur(), c = api.cur();
+    if (!dragging && d > 0) seek.value = Math.round(c / d * 1000);
+    timeEl.textContent = fmt(c) + ' / ' + fmt(d);
+    playBtn.innerHTML = api.isPlaying() ? '&#10074;&#10074;' : '&#9654;';
+  }
+  setInterval(refresh, 300);
+
+  playBtn.onclick = function () {
+    if (!api) return;
+    api.isPlaying() ? api.pause() : api.play();
+    setTimeout(refresh, 100);
+  };
+  seek.addEventListener('input', function () { dragging = true; });
+  seek.addEventListener('change', function () {
+    dragging = false;
+    if (api && api.dur() > 0) api.seekTo(seek.value / 1000 * api.dur());
+  });
+
+  function setSpeed(r) {
+    rate = r;
+    if (api) api.setRate(r);
+    Array.prototype.forEach.call(speedWrap.children, function (b) {
+      b.classList.toggle('on', parseFloat(b.dataset.r) === r);
+    });
+    try { localStorage.setItem('speed', r); } catch (e) {}
+  }
+  speeds.forEach(function (r) {
+    var b = document.createElement('button');
+    b.textContent = r + 'x';
+    b.dataset.r = r;
+    b.onclick = function () { setSpeed(r); };
+    speedWrap.appendChild(b);
+  });
+  setSpeed(rate);
+
+  function showError(msg) { note.hidden = false; note.textContent = msg; }
+
+  // ---- 소스 1: 유튜브 영상(소리만) ----
+  function startYouTube(id) {
+    window.onYouTubeIframeAPIReady = function () {
+      var player = new YT.Player('yt', {
+        width: '200', height: '200', videoId: id,
+        playerVars: { playsinline: 1, controls: 0, rel: 0, fs: 0, disablekb: 1, modestbranding: 1 },
+        events: {
+          onReady: function () {
+            api = {
+              play: function () { player.playVideo(); },
+              pause: function () { player.pauseVideo(); },
+              isPlaying: function () { return player.getPlayerState() === 1; },
+              seekTo: function (t) { player.seekTo(t, true); },
+              cur: function () { return player.getCurrentTime(); },
+              dur: function () { return player.getDuration(); },
+              setRate: function (r) { player.setPlaybackRate(r); }
+            };
+            setSpeed(rate);
+          },
+          onStateChange: function (e) {
+            // 재생이 시작될 때 배속을 다시 적용
+            if (e.data === 1) player.setPlaybackRate(rate);
+          },
+          onError: function () {
+            showError('이 영상은 외부 사이트에서 재생할 수 없도록 설정되어 있습니다. 영상 소유자에게 퍼가기 허용을 요청하거나 mp3 파일을 사용해 주세요.');
+          }
+        }
+      });
+    };
+    var s = document.createElement('script');
+    s.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(s);
+  }
+
+  // ---- 소스 2: audio 폴더의 mp3 ----
+  function startMp3(file) {
+    var a = new Audio(file);
+    a.preload = 'auto';
+    a.preservesPitch = true;
+    a.addEventListener('error', function () { showError(file + ' 파일을 찾을 수 없습니다.'); });
+    a.addEventListener('play', function () { a.playbackRate = rate; });
+    api = {
+      play: function () { a.playbackRate = rate; a.play(); },
+      pause: function () { a.pause(); },
+      isPlaying: function () { return !a.paused && !a.ended; },
+      seekTo: function (t) { a.currentTime = t; },
+      cur: function () { return a.currentTime; },
+      dur: function () { return a.duration || 0; },
+      setRate: function (r) { a.playbackRate = r; }
+    };
+  }
+
+  if (VIDEOS[day]) startYouTube(VIDEOS[day]);
+  else startMp3('audio/' + String(day).padStart(2, '0') + '.mp3');
+})();
+</script>
+</body>
+</html>
